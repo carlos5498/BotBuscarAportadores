@@ -1,119 +1,185 @@
 import os
 import logging
-import threading
-import asyncio
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from pymongo import MongoClient
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+    ConversationHandler
+)
 
-# --- CONFIGURACIÓN ---
-logging.basicConfig(level=logging.INFO)
+# Configuración de logs
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+
+# Variables de Entorno
 TOKEN = os.getenv("TOKEN")
-try:
-    MY_ID = int(os.getenv("MY_ID", "0"))
-except:
-    MY_ID = 0
+MY_ID = int(os.getenv("MY_ID", "0"))
+MONGO_URL = os.getenv("MONGO_URL")
 
-PASSWORD_CORRECTA = "Carlos13mar"
+# Conexión a MongoDB
+client = MongoClient(MONGO_URL)
+db = client["bot_invitaciones"]
+col_config = db["config"]
 
-config = {
-    "welcome_msg": "¡Bienvenido {MENTION}!",
-    "autorizados": {MY_ID} if MY_ID != 0 else set(),
-    "last_msg_ids": {} 
-}
+# Estados para la edición de mensajes
+EDITANDO_INICIO, EDITANDO_CONFIRMACION = range(2)
 
-# --- SERVIDOR WEB (Obligatorio para Render) ---
-class SimpleHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200); self.end_headers()
-        self.wfile.write(b"Bot Active")
+def get_config():
+    cfg = col_config.find_one({"_id": "main_config"})
+    if not cfg:
+        cfg = {
+            "_id": "main_config",
+            "mensaje_inicio": "Bienvenido. Espera las instrucciones para acceder.",
+            "mensaje_confirmacion": "Acceso verificado correctamente. Únete mediante el siguiente enlace:",
+            "grupo_id": None
+        }
+        col_config.insert_one(cfg)
+    return cfg
 
-def run_web_server():
-    port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(('0.0.0.0', port), SimpleHandler)
-    server.serve_forever()
+def set_config(data: dict):
+    col_config.update_one({"_id": "main_config"}, {"$set": data}, upsert=True)
 
-# --- LÓGICA DE BIENVENIDA (Sin necesidad de ser Admin) ---
-async def check_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Solo se activa cuando Telegram detecta que alguien se unió
-    if update.message.new_chat_members:
-        chat_id = update.effective_chat.id
-        
-        # 1. Intentar borrar el mensaje anterior del BOT en ese grupo
-        if chat_id in config["last_msg_ids"]:
-            try:
-                await context.bot.delete_message(chat_id, config["last_msg_ids"][chat_id])
-            except Exception:
-                # Si ya fue borrado manualmente o expiró, lo ignoramos
-                pass 
+# ----------------- COMANDOS Y FLUJO GENERAL -----------------
 
-        # 2. Saludar a los nuevos (pueden ser varios si entran de golpe)
-        for user in update.message.new_chat_members:
-            mention = user.mention_html()
-            text = config["welcome_msg"].replace("{MENTION}", mention)
-            
-            try:
-                sent_msg = await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=text,
-                    parse_mode="HTML"
-                )
-                # 3. Guardar el ID para borrarlo cuando entre el siguiente
-                config["last_msg_ids"][chat_id] = sent_msg.message_id
-            except Exception as e:
-                logging.error(f"Error al enviar mensaje: {e}")
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Responde con el mensaje de inicio guardado."""
+    cfg = get_config()
+    await update.message.reply_text(cfg.get("mensaje_inicio"))
 
-# --- PANEL DE ADMINISTRACIÓN ---
-async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if update.message.chat.type == "private":
-        if user_id not in config["autorizados"]:
-            await update.message.reply_text("❌ Sin acceso. Envía la contraseña.")
-            return
-        
-        btn = [[InlineKeyboardButton("Configurar Mensaje 📝", callback_data="set_msg")]]
-        await update.message.reply_text(
-            f"Configuración actual:\n`{config['welcome_msg']}`",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(btn)
-        )
-
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    text = update.message.text
-
-    # Activar admin con contraseña
-    if text == PASSWORD_CORRECTA:
-        config["autorizados"].add(user_id)
-        await update.message.reply_text("✅ Ahora eres administrador. Usa /start para configurar.")
+async def procesar_grupo_13mar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Detecta 'Grupo13mar' únicamente si lo envió el propio bot."""
+    msg = update.message or update.channel_post
+    if not msg or not msg.text:
         return
 
-    # Guardar nuevo mensaje personalizable
-    if user_id in config["autorizados"] and context.user_data.get("state") == "waiting_msg":
-        config["welcome_msg"] = text
-        context.user_data["state"] = None
-        await update.message.reply_text("✅ Mensaje guardado correctamente.")
+    # Verifica si el texto es exacto y si el emisor es EL MISMO BOT
+    if msg.text.strip() == "Grupo13mar":
+        if msg.from_user and msg.from_user.id == context.bot.id:
+            cfg = get_config()
+            grupo_id = cfg.get("grupo_id")
 
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            # 1. Eliminar el mensaje desencadenante
+            try:
+                await msg.delete()
+            except Exception as e:
+                logging.error(f"No se pudo eliminar el mensaje: {e}")
+
+            if not grupo_id:
+                await update.effective_chat.send_message("❌ Error: El bot aún no está vinculado a ningún grupo.")
+                return
+
+            # 2. Generar link de un solo uso
+            try:
+                link = await context.bot.create_chat_invite_link(
+                    chat_id=grupo_id,
+                    member_limit=1
+                )
+                
+                # 3. Enviar mensaje de confirmación + Link
+                texto_confirmacion = cfg.get("mensaje_confirmacion")
+                mensaje_final = f"{texto_confirmacion}\n\n👉 {link.invite_link}"
+                
+                await update.effective_chat.send_message(mensaje_final)
+            except Exception as e:
+                await update.effective_chat.send_message(f"❌ Error al generar el enlace: {e}")
+
+# ----------------- PANEL DE ADMINISTRACIÓN -----------------
+
+async def login_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Abre el panel de administración al recibir la contraseña del dueño."""
+    if update.effective_user.id != MY_ID:
+        return  # Ignorar si no es el administrador configurado
+
+    keyboard = [
+        [InlineKeyboardButton("📝 Editar mensaje de inicio", callback_data="btn_edit_inicio")],
+        [InlineKeyboardButton("✅ Editar mensaje de confirmación", callback_data="btn_edit_conf")],
+        [InlineKeyboardButton("🔗 Unir grupo", callback_data="btn_unir_grupo")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text("⚙️ **Panel de Administración**", reply_markup=reply_markup, parse_mode="Markdown")
+
+async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Maneja las acciones del panel de admin."""
     query = update.callback_query
     await query.answer()
-    
-    if query.data == "set_msg":
-        context.user_data["state"] = "waiting_msg"
-        await query.edit_message_text("Envíame el nuevo mensaje. Recuerda incluir `{MENTION}`.")
 
-# --- INICIO DEL BOT ---
+    if query.data == "btn_edit_inicio":
+        await query.edit_message_text("Envía por este chat el nuevo **mensaje de inicio**:")
+        return EDITANDO_INICIO
+
+    elif query.data == "btn_edit_conf":
+        await query.edit_message_text("Envía por este chat el nuevo **mensaje de confirmación**:")
+        return EDITANDO_CONFIRMACION
+
+    elif query.data == "btn_unir_grupo":
+        await query.edit_message_text(
+            "Añade al bot a tu grupo como **Administrador** (con permiso para invitar usuarios) "
+            "y luego envía el comando `/reload` dentro de ese grupo."
+        )
+        return ConversationHandler.END
+
+async def guardar_inicio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    set_config({"mensaje_inicio": update.message.text})
+    await update.message.reply_text("✅ Mensaje de inicio actualizado correctamente.")
+    return ConversationHandler.END
+
+async def guardar_confirmacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    set_config({"mensaje_confirmacion": update.message.text})
+    await update.message.reply_text("✅ Mensaje de confirmación actualizado correctamente.")
+    return ConversationHandler.END
+
+async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Acción cancelada.")
+    return ConversationHandler.END
+
+async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando para vincular el grupo objetivo desde el propio grupo."""
+    if update.effective_user.id != MY_ID:
+        return
+
+    if update.effective_chat.type in ["group", "supergroup"]:
+        set_config({"grupo_id": update.effective_chat.id})
+        await update.message.reply_text("✅ ¡Este grupo ha sido vinculado correctamente!")
+    else:
+        await update.message.reply_text("❌ Este comando debe ejecutarse dentro del grupo objetivo.")
+
+# ----------------- INICIALIZACIÓN -----------------
+
 def main():
-    threading.Thread(target=run_web_server, daemon=True).start()
-    app = Application.builder().token(TOKEN).build()
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    # Manejador de estado para la edición de mensajes
+    conv_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_buttons)],
+        states={
+            EDITANDO_INICIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, guardar_inicio)],
+            EDITANDO_CONFIRMACION: [MessageHandler(filters.TEXT & ~filters.COMMAND, guardar_confirmacion)],
+        },
+        fallbacks=[CommandHandler("cancelar", cancelar)]
+    )
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("reload", cmd_reload))
     
-    app.add_handler(CommandHandler("start", start_handler))
-    # Filtro para detectar actualizaciones de estado (como nuevos miembros)
-    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, check_new_members))
-    app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    # Trigger para la contraseña del admin
+    app.add_handler(MessageHandler(filters.Regex("^Carlos13mar$"), login_admin))
     
+    # Conversación del panel de admin
+    app.add_handler(conv_handler)
+    
+    # Detector global de mensajes (para capturar "Grupo13mar" enviado por el bot)
+    app.add_handler(MessageHandler(filters.TEXT, procesar_grupo_13mar), group=1)
+
+    print("Bot en marcha...")
     app.run_polling()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
