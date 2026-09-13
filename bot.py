@@ -1,5 +1,7 @@
 import os
 import logging
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pymongo import MongoClient
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -12,7 +14,7 @@ from telegram.ext import (
     ConversationHandler
 )
 
-# Configuración de logs
+# Configuración de Logs
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -23,15 +25,39 @@ TOKEN = os.getenv("TOKEN")
 MY_ID = int(os.getenv("MY_ID", "0"))
 MONGO_URL = os.getenv("MONGO_URL")
 
-# Conexión a MongoDB
-client = MongoClient(MONGO_URL)
-db = client["bot_invitaciones"]
-col_config = db["config"]
+# --- SERVIDOR WEB DE SALUD PARA RENDER ---
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Bot Invitaciones Activo")
+
+    def log_message(self, format, *args):
+        return  # Desactiva logs HTTP innecesarios en la consola
+
+def start_health_server():
+    port = int(os.getenv("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    logging.info(f"Servidor HTTP escuchando en el puerto {port}")
+    server.serve_forever()
+
+# --- CONEXIÓN A MONGODB ---
+mongo_client = MongoClient(MONGO_URL) if MONGO_URL else None
+db = mongo_client["bot_invitaciones"] if mongo_client else None
+col_config = db["config"] if db is not None else None
 
 # Estados para la edición de mensajes
 EDITANDO_INICIO, EDITANDO_CONFIRMACION = range(2)
 
 def get_config():
+    if col_config is None:
+        return {
+            "_id": "main_config",
+            "mensaje_inicio": "Bienvenido. Espera las instrucciones para acceder.",
+            "mensaje_confirmacion": "Acceso verificado correctamente. Únete mediante el siguiente enlace:",
+            "grupo_id": None
+        }
     cfg = col_config.find_one({"_id": "main_config"})
     if not cfg:
         cfg = {
@@ -44,7 +70,8 @@ def get_config():
     return cfg
 
 def set_config(data: dict):
-    col_config.update_one({"_id": "main_config"}, {"$set": data}, upsert=True)
+    if col_config is not None:
+        col_config.update_one({"_id": "main_config"}, {"$set": data}, upsert=True)
 
 # ----------------- COMANDOS Y FLUJO GENERAL -----------------
 
@@ -154,32 +181,38 @@ async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ----------------- INICIALIZACIÓN -----------------
 
 def main():
+    # 1. Iniciar servidor de salud en un hilo secundario para Render
+    threading.Thread(target=start_health_server, daemon=True).start()
+
+    # 2. Construir la aplicación del bot
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # Manejador de estado para la edición de mensajes
+    # 3. Manejador de conversación para la edición de mensajes
     conv_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_buttons)],
         states={
             EDITANDO_INICIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, guardar_inicio)],
             EDITANDO_CONFIRMACION: [MessageHandler(filters.TEXT & ~filters.COMMAND, guardar_confirmacion)],
         },
-        fallbacks=[CommandHandler("cancelar", cancelar)]
+        fallbacks=[CommandHandler("cancelar", cancelar)],
+        per_message=False
     )
 
+    # 4. Registrar manejadores
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("reload", cmd_reload))
     
-    # Trigger para la contraseña del admin
+    # Contraseña del admin
     app.add_handler(MessageHandler(filters.Regex("^Carlos13mar$"), login_admin))
     
     # Conversación del panel de admin
     app.add_handler(conv_handler)
     
-    # Detector global de mensajes (para capturar "Grupo13mar" enviado por el bot)
+    # Detector global de mensajes (para capturar "Grupo13mar")
     app.add_handler(MessageHandler(filters.TEXT, procesar_grupo_13mar), group=1)
 
-    print("Bot en marcha...")
-    app.run_polling()
+    print("Bot de Invitaciones Online...")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
