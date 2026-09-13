@@ -46,9 +46,14 @@ def start_health_server():
 mongo_client = MongoClient(MONGO_URL) if MONGO_URL else None
 db = mongo_client["bot_invitaciones"] if mongo_client else None
 col_config = db["config"] if db is not None else None
+col_admins = db["admins"] if db is not None else None
+col_banned = db["banned"] if db is not None else None
+col_requests = db["pending_requests"] if db is not None else None
 
 # Estados para la edición de mensajes
 EDITANDO_INICIO, EDITANDO_CONFIRMACION = range(2)
+
+# --- FUNCIONES DE BASE DE DATOS Y PERMISOS ---
 
 def get_config():
     if col_config is None:
@@ -73,6 +78,55 @@ def set_config(data: dict):
     if col_config is not None:
         col_config.update_one({"_id": "main_config"}, {"$set": data}, upsert=True)
 
+def get_admin_ids() -> set:
+    """Obtiene el ID principal y todos los admins adicionales agregados."""
+    admins = {MY_ID}
+    if col_admins is not None:
+        for doc in col_admins.find():
+            admins.add(doc["_id"])
+    return admins
+
+def is_admin(user_id: int) -> bool:
+    """Verifica si un usuario es admin (el principal o uno agregado)."""
+    if user_id == MY_ID:
+        return True
+    if col_admins is not None:
+        return col_admins.find_one({"_id": user_id}) is not None
+    return False
+
+def is_banned(user_id: int) -> bool:
+    """Verifica si un usuario está en la lista de baneados."""
+    if col_banned is not None:
+        return col_banned.find_one({"_id": user_id}) is not None
+    return False
+
+def ban_user(user_id: int):
+    """Guarda un ID en la lista negra."""
+    if col_banned is not None:
+        col_banned.update_one({"_id": user_id}, {"$set": {"_id": user_id}}, upsert=True)
+
+def add_admin_id(user_id: int):
+    """Guarda un nuevo administrador en la base de datos."""
+    if col_admins is not None:
+        col_admins.update_one({"_id": user_id}, {"$set": {"_id": user_id}}, upsert=True)
+
+async def limpiar_solicitudes_usuario(context: ContextTypes.DEFAULT_TYPE, target_user_id: int):
+    """Elimina las notificaciones de este usuario del privado de todos los administradores."""
+    if col_requests is None:
+        return
+
+    solicitudes = list(col_requests.find({"user_id": target_user_id}))
+    for req in solicitudes:
+        try:
+            await context.bot.delete_message(
+                chat_id=req["admin_id"],
+                message_id=req["message_id"]
+            )
+        except Exception as e:
+            logging.warning(f"No se pudo eliminar el mensaje {req['message_id']} para el admin {req['admin_id']}: {e}")
+
+    col_requests.delete_many({"user_id": target_user_id})
+
 # ----------------- COMANDOS Y FLUJO GENERAL -----------------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -80,49 +134,132 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cfg = get_config()
     await update.message.reply_text(cfg.get("mensaje_inicio"))
 
-async def procesar_grupo_13mar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Detecta 'Grupo13mar' únicamente si lo envió el propio bot."""
-    msg = update.message or update.channel_post
-    if not msg or not msg.text:
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Permite agregar nuevos administradores usando /admin <ID>."""
+    if not is_admin(update.effective_user.id):
         return
 
-    # Verifica si el texto es exacto y si el emisor es EL MISMO BOT
-    if msg.text.strip() == "Grupo13mar":
-        if msg.from_user and msg.from_user.id == context.bot.id:
-            cfg = get_config()
-            grupo_id = cfg.get("grupo_id")
+    if not context.args:
+        await update.message.reply_text("❌ Uso correcto: `/admin ID`", parse_mode="Markdown")
+        return
 
-            # 1. Eliminar el mensaje desencadenante
-            try:
-                await msg.delete()
-            except Exception as e:
-                logging.error(f"No se pudo eliminar el mensaje: {e}")
+    try:
+        nuevo_admin_id = int(context.args[0])
+        add_admin_id(nuevo_admin_id)
+        await update.message.reply_text(f"✅ Administrador `{nuevo_admin_id}` añadido correctamente.", parse_mode="Markdown")
+    except ValueError:
+        await update.message.reply_text("❌ El ID debe ser un número entero válido.")
 
-            if not grupo_id:
-                await update.effective_chat.send_message("❌ Error: El bot aún no está vinculado a ningún grupo.")
-                return
+async def cmd_solicitar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Procesa la solicitud de ingreso enviada por el usuario."""
+    user = update.effective_user
+    user_id = user.id
 
-            # 2. Generar link de un solo uso
-            try:
-                link = await context.bot.create_chat_invite_link(
-                    chat_id=grupo_id,
-                    member_limit=1
-                )
-                
-                # 3. Enviar mensaje de confirmación + Link
-                texto_confirmacion = cfg.get("mensaje_confirmacion")
-                mensaje_final = f"{texto_confirmacion}\n\n👉 {link.invite_link}"
-                
-                await update.effective_chat.send_message(mensaje_final)
-            except Exception as e:
-                await update.effective_chat.send_message(f"❌ Error al generar el enlace: {e}")
+    if is_banned(user_id):
+        return  # Los usuarios baneados no reciben respuesta ni pueden enviar más solicitudes
+
+    # Responde al usuario que realizó la solicitud
+    await update.message.reply_text(
+        "Has enviado una solicitud, un admin la revisara asegúrate de haber cumplido todos tus requisitos"
+    )
+
+    # Datos para notificar a los administradores
+    nombre = user.full_name
+    username = f"@{user.username}" if user.username else "Sin username"
+    texto_admin = (
+        f"👤 **Nueva Solicitud de Acceso**\n\n"
+        f"• **Nombre:** {nombre}\n"
+        f"• **Username:** {username}\n"
+        f"• **ID:** `{user_id}`"
+    )
+
+    keyboard = [
+        [
+            InlineKeyboardButton("Aceptar", callback_data=f"req_aceptar_{user_id}"),
+            InlineKeyboardButton("Denegar", callback_data=f"req_denegar_{user_id}"),
+            InlineKeyboardButton("Ban", callback_data=f"req_ban_{user_id}")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    # Notifica a la lista completa de administradores
+    admins = get_admin_ids()
+    for admin_id in admins:
+        try:
+            msg = await context.bot.send_message(
+                chat_id=admin_id,
+                text=texto_admin,
+                reply_markup=reply_markup,
+                parse_mode="Markdown"
+            )
+            # Guarda la referencia del mensaje para poder borrarlo después
+            if col_requests is not None:
+                col_requests.insert_one({
+                    "user_id": user_id,
+                    "admin_id": admin_id,
+                    "message_id": msg.message_id
+                })
+        except Exception as e:
+            logging.error(f"Error al enviar mensaje de solicitud al admin {admin_id}: {e}")
+
+async def cb_procesar_solicitud(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Acciones al accionar los botones Aceptar, Denegar o Ban en una solicitud."""
+    query = update.callback_query
+    admin_user = update.effective_user
+
+    if not is_admin(admin_user.id):
+        await query.answer("❌ No tienes permisos de administrador.", show_alert=True)
+        return
+
+    await query.answer()
+
+    data_parts = query.data.split("_")
+    accion = data_parts[1]
+    target_user_id = int(data_parts[2])
+
+    cfg = get_config()
+    grupo_id = cfg.get("grupo_id")
+
+    if accion == "aceptar":
+        if not grupo_id:
+            await query.message.reply_text("❌ Error: Vincula el grupo primero usando el comando /reload dentro del grupo.")
+            return
+
+        try:
+            # 1. Generar enlace de invitación de un solo uso
+            link = await context.bot.create_chat_invite_link(
+                chat_id=grupo_id,
+                member_limit=1
+            )
+            texto_conf = cfg.get("mensaje_confirmacion")
+            mensaje_final = f"{texto_conf}\n\n👉 {link.invite_link}"
+
+            # 2. Enviar confirmación al usuario
+            await context.bot.send_message(chat_id=target_user_id, text=mensaje_final)
+        except Exception as e:
+            logging.error(f"Error enviando la invitación al usuario {target_user_id}: {e}")
+
+    elif accion == "denegar":
+        try:
+            await context.bot.send_message(
+                chat_id=target_user_id,
+                text="Tu solicitud ha sido denegada, no cumpliste con los requisitos"
+            )
+        except Exception as e:
+            logging.error(f"Error notificando denegación a {target_user_id}: {e}")
+
+    elif accion == "ban":
+        ban_user(target_user_id)
+
+    # Elimina los mensajes de solicitud guardados en los chats privados de todos los admins
+    await limpiar_solicitudes_usuario(context, target_user_id)
 
 # ----------------- PANEL DE ADMINISTRACIÓN -----------------
 
 async def login_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Abre el panel de administración al recibir la contraseña del dueño."""
-    if update.effective_user.id != MY_ID:
-        return  # Ignorar si no es el administrador configurado
+    """Abre el panel de administración."""
+    if not is_admin(update.effective_user.id):
+        return
 
     keyboard = [
         [InlineKeyboardButton("📝 Editar mensaje de inicio", callback_data="btn_edit_inicio")],
@@ -134,7 +271,7 @@ async def login_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⚙️ **Panel de Administración**", reply_markup=reply_markup, parse_mode="Markdown")
 
 async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Maneja las acciones del panel de admin."""
+    """Maneja las opciones internas del panel de administración."""
     query = update.callback_query
     await query.answer()
 
@@ -169,7 +306,7 @@ async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Comando para vincular el grupo objetivo desde el propio grupo."""
-    if update.effective_user.id != MY_ID:
+    if not is_admin(update.effective_user.id):
         return
 
     if update.effective_chat.type in ["group", "supergroup"]:
@@ -189,7 +326,7 @@ def main():
 
     # 3. Manejador de conversación para la edición de mensajes
     conv_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_buttons)],
+        entry_points=[CallbackQueryHandler(admin_buttons, pattern="^btn_")],
         states={
             EDITANDO_INICIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, guardar_inicio)],
             EDITANDO_CONFIRMACION: [MessageHandler(filters.TEXT & ~filters.COMMAND, guardar_confirmacion)],
@@ -198,18 +335,20 @@ def main():
         per_message=False
     )
 
-    # 4. Registrar manejadores
+    # 4. Registrar comandos y manejadores
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CommandHandler("solicitar", cmd_solicitar))
     app.add_handler(CommandHandler("reload", cmd_reload))
     
-    # Contraseña del admin
+    # Manejador para los botones de la solicitud (Aceptar, Denegar, Ban)
+    app.add_handler(CallbackQueryHandler(cb_procesar_solicitud, pattern="^req_(aceptar|denegar|ban)_"))
+    
+    # Contraseña para el panel de administración
     app.add_handler(MessageHandler(filters.Regex("^Carlos13mar$"), login_admin))
     
-    # Conversación del panel de admin
+    # Conversación para la edición de textos
     app.add_handler(conv_handler)
-    
-    # Detector global de mensajes (para capturar "Grupo13mar")
-    app.add_handler(MessageHandler(filters.TEXT, procesar_grupo_13mar), group=1)
 
     print("Bot de Invitaciones Online...")
     app.run_polling(drop_pending_updates=True)
