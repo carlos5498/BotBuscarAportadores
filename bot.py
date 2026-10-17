@@ -1,357 +1,312 @@
+import asyncio
+from datetime import datetime
+import http.server
 import os
-import logging
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from pymongo import MongoClient
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
+    Application,
     CallbackQueryHandler,
+    CommandHandler,
     ContextTypes,
+    MessageHandler,
     filters,
-    ConversationHandler
 )
+from pymongo import MongoClient
 
-# Configuración de Logs
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-
-# Variables de Entorno
+# --- CONFIGURACIÓN DE VARIABLES DE ENTORNO ---
 TOKEN = os.getenv("TOKEN")
-MY_ID = int(os.getenv("MY_ID", "0"))
-MONGO_URL = os.getenv("MONGO_URL")
+MONGO_URI = os.getenv("MONGO")
 
-# --- SERVIDOR WEB DE SALUD PARA RENDER ---
-class HealthCheckHandler(BaseHTTPRequestHandler):
+if not TOKEN or not MONGO_URI:
+    raise ValueError("Faltan variables de entorno requeridas (TOKEN, MONGO)")
+
+# --- CONFIGURACIÓN DE BASE DE DATOS MONGODB ---
+db_name = f"fast_response_bot_db_{TOKEN.split(':')[0]}"
+client = MongoClient(MONGO_URI)
+db = client[db_name]
+
+users_collection = db["users"]
+settings_collection = db["settings"]
+groups_collection = db["groups"]
+
+# Inicializar configuración por defecto si no existe
+if settings_collection.count_documents({}) == 0:
+    settings_collection.insert_one({
+        "welcome_msg": "👋 ¡Hola! Para obtener el enlace de acceso al grupo, debes enviar un total de {req} aportes (imágenes, videos o archivos).",
+        "acceptance_msg": "🎉 ¡Felicidades! Has completado el mínimo de aportes. Aquí tienes tu enlace de acceso:",
+        "required_contributions": 150,
+        "selected_group_id": None,
+    })
+
+# Diccionario en memoria para rastrear estados de entrada del admin
+admin_input_states = {}
+
+
+def get_settings():
+    return settings_collection.find_one({})
+
+
+# --- SERVIDOR WEB PARA RENDER Y CRONJOB ---
+class HealthCheckHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
-        self.send_header("Content-type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"Bot Invitaciones Activo")
+        self.wfile.write(b"Fast Response Bot is active!")
 
     def log_message(self, format, *args):
-        return  # Desactiva logs HTTP innecesarios en la consola
+        pass
 
-def start_health_server():
-    port = int(os.getenv("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    logging.info(f"Servidor HTTP escuchando en el puerto {port}")
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = http.server.HTTPServer(("0.0.0.0", port), HealthCheckHandler)
     server.serve_forever()
 
-# --- CONEXIÓN A MONGODB ---
-mongo_client = MongoClient(MONGO_URL) if MONGO_URL else None
-db = mongo_client["bot_invitaciones"] if mongo_client else None
-col_config = db["config"] if db is not None else None
-col_admins = db["admins"] if db is not None else None
-col_banned = db["banned"] if db is not None else None
-col_requests = db["pending_requests"] if db is not None else None
 
-# Estados para la edición de mensajes
-EDITANDO_INICIO, EDITANDO_CONFIRMACION = range(2)
+# --- PANEL DE ADMINISTRACIÓN ---
+async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    settings = get_settings()
+    selected_gid = settings.get("selected_group_id")
+    
+    group_name = "Ninguno seleccionado"
+    if selected_gid:
+        grp = groups_collection.find_one({"group_id": selected_gid})
+        if grp:
+            group_name = grp.get("title", f"ID: {selected_gid}")
 
-# --- FUNCIONES DE BASE DE DATOS Y PERMISOS ---
-
-def get_config():
-    if col_config is None:
-        return {
-            "_id": "main_config",
-            "mensaje_inicio": "Bienvenido. Espera las instrucciones para acceder.",
-            "mensaje_confirmacion": "Acceso verificado correctamente. Únete mediante el siguiente enlace:",
-            "grupo_id": None
-        }
-    cfg = col_config.find_one({"_id": "main_config"})
-    if not cfg:
-        cfg = {
-            "_id": "main_config",
-            "mensaje_inicio": "Bienvenido. Espera las instrucciones para acceder.",
-            "mensaje_confirmacion": "Acceso verificado correctamente. Únete mediante el siguiente enlace:",
-            "grupo_id": None
-        }
-        col_config.insert_one(cfg)
-    return cfg
-
-def set_config(data: dict):
-    if col_config is not None:
-        col_config.update_one({"_id": "main_config"}, {"$set": data}, upsert=True)
-
-def get_admin_ids() -> set:
-    """Obtiene el ID principal y todos los admins adicionales agregados."""
-    admins = {MY_ID}
-    if col_admins is not None:
-        for doc in col_admins.find():
-            admins.add(doc["_id"])
-    return admins
-
-def is_admin(user_id: int) -> bool:
-    """Verifica si un usuario es admin (el principal o uno agregado)."""
-    if user_id == MY_ID:
-        return True
-    if col_admins is not None:
-        return col_admins.find_one({"_id": user_id}) is not None
-    return False
-
-def is_banned(user_id: int) -> bool:
-    """Verifica si un usuario está en la lista de baneados."""
-    if col_banned is not None:
-        return col_banned.find_one({"_id": user_id}) is not None
-    return False
-
-def ban_user(user_id: int):
-    """Guarda un ID en la lista negra."""
-    if col_banned is not None:
-        col_banned.update_one({"_id": user_id}, {"$set": {"_id": user_id}}, upsert=True)
-
-def add_admin_id(user_id: int):
-    """Guarda un nuevo administrador en la base de datos."""
-    if col_admins is not None:
-        col_admins.update_one({"_id": user_id}, {"$set": {"_id": user_id}}, upsert=True)
-
-async def limpiar_solicitudes_usuario(context: ContextTypes.DEFAULT_TYPE, target_user_id: int):
-    """Elimina las notificaciones de este usuario del privado de todos los administradores."""
-    if col_requests is None:
-        return
-
-    solicitudes = list(col_requests.find({"user_id": target_user_id}))
-    for req in solicitudes:
-        try:
-            await context.bot.delete_message(
-                chat_id=req["admin_id"],
-                message_id=req["message_id"]
-            )
-        except Exception as e:
-            logging.warning(f"No se pudo eliminar el mensaje {req['message_id']} para el admin {req['admin_id']}: {e}")
-
-    col_requests.delete_many({"user_id": target_user_id})
-
-# ----------------- COMANDOS Y FLUJO GENERAL -----------------
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Responde con el mensaje de inicio guardado."""
-    cfg = get_config()
-    await update.message.reply_text(cfg.get("mensaje_inicio"))
-
-async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Permite agregar nuevos administradores usando /admin <ID>."""
-    if not is_admin(update.effective_user.id):
-        return
-
-    if not context.args:
-        await update.message.reply_text("❌ Uso correcto: `/admin ID`", parse_mode="Markdown")
-        return
-
-    try:
-        nuevo_admin_id = int(context.args[0])
-        add_admin_id(nuevo_admin_id)
-        await update.message.reply_text(f"✅ Administrador `{nuevo_admin_id}` añadido correctamente.", parse_mode="Markdown")
-    except ValueError:
-        await update.message.reply_text("❌ El ID debe ser un número entero válido.")
-
-async def cmd_solicitar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Procesa la solicitud de ingreso enviada por el usuario."""
-    user = update.effective_user
-    user_id = user.id
-
-    if is_banned(user_id):
-        return  # Los usuarios baneados no reciben respuesta ni pueden enviar más solicitudes
-
-    # Responde al usuario que realizó la solicitud
-    await update.message.reply_text(
-        "Has enviado una solicitud, un admin la revisara asegúrate de haber cumplido todos tus requisitos"
-    )
-
-    # Datos para notificar a los administradores
-    nombre = user.full_name
-    username = f"@{user.username}" if user.username else "Sin username"
-    texto_admin = (
-        f"👤 **Nueva Solicitud de Acceso**\n\n"
-        f"• **Nombre:** {nombre}\n"
-        f"• **Username:** {username}\n"
-        f"• **ID:** `{user_id}`"
+    text = (
+        "⚙️ **Panel de Administración (Respuesta Rápida)**\n\n"
+        f"👋 **Mensaje de Bienvenida:**\n`{settings.get('welcome_msg')}`\n\n"
+        f"📦 **Aportes Requeridos:** `{settings.get('required_contributions')}`\n"
+        f"📢 **Grupo Seleccionado:** `{group_name}`\n"
+        f"📩 **Mensaje de Aceptación:**\n`{settings.get('acceptance_msg')}`\n"
     )
 
     keyboard = [
-        [
-            InlineKeyboardButton("Aceptar", callback_data=f"req_aceptar_{user_id}"),
-            InlineKeyboardButton("Denegar", callback_data=f"req_denegar_{user_id}"),
-            InlineKeyboardButton("Ban", callback_data=f"req_ban_{user_id}")
-        ]
+        [InlineKeyboardButton("👋 Editar Bienvenida", callback_data="set_welcome")],
+        [InlineKeyboardButton("📦 Editar Aportes", callback_data="set_req_aportes")],
+        [InlineKeyboardButton("📢 Seleccionar Grupo", callback_data="select_group")],
+        [InlineKeyboardButton("📩 Editar Aceptación", callback_data="set_acceptance")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    # Notifica a la lista completa de administradores
-    admins = get_admin_ids()
-    for admin_id in admins:
-        try:
-            msg = await context.bot.send_message(
-                chat_id=admin_id,
-                text=texto_admin,
-                reply_markup=reply_markup,
-                parse_mode="Markdown"
-            )
-            # Guarda la referencia del mensaje para poder borrarlo después
-            if col_requests is not None:
-                col_requests.insert_one({
-                    "user_id": user_id,
-                    "admin_id": admin_id,
-                    "message_id": msg.message_id
-                })
-        except Exception as e:
-            logging.error(f"Error al enviar mensaje de solicitud al admin {admin_id}: {e}")
+    if update.message:
+        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+    elif update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode="Markdown")
 
-async def cb_procesar_solicitud(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Acciones al accionar los botones Aceptar, Denegar o Ban en una solicitud."""
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    admin_user = update.effective_user
-
-    if not is_admin(admin_user.id):
-        await query.answer("❌ No tienes permisos de administrador.", show_alert=True)
-        return
-
     await query.answer()
+    data = query.data
+    user_id = query.from_user.id
 
-    data_parts = query.data.split("_")
-    accion = data_parts[1]
-    target_user_id = int(data_parts[2])
+    if data == "set_welcome":
+        admin_input_states[user_id] = "waiting_welcome"
+        await query.message.reply_text("Envía el nuevo **Mensaje de Bienvenida** (puedes usar `{req}` para mostrar el número de aportes):")
 
-    cfg = get_config()
-    grupo_id = cfg.get("grupo_id")
+    elif data == "set_req_aportes":
+        admin_input_states[user_id] = "waiting_req_aportes"
+        await query.message.reply_text("Envía la cantidad mínima de aportes requeridos (ej. 150):")
 
-    if accion == "aceptar":
-        if not grupo_id:
-            await query.message.reply_text("❌ Error: Vincula el grupo primero usando el comando /reload dentro del grupo.")
+    elif data == "set_acceptance":
+        admin_input_states[user_id] = "waiting_acceptance"
+        await query.message.reply_text("Envía el nuevo **Mensaje de Aceptación**:")
+
+    elif data == "select_group":
+        groups = list(groups_collection.find({}))
+        if not groups:
+            await query.message.reply_text("⚠️ No hay grupos registrados. Usa el comando `/reload` dentro del grupo donde el bot sea admin.")
             return
 
-        try:
-            # 1. Generar enlace de invitación de un solo uso
-            link = await context.bot.create_chat_invite_link(
-                chat_id=grupo_id,
-                member_limit=1
-            )
-            texto_conf = cfg.get("mensaje_confirmacion")
-            mensaje_final = f"{texto_conf}\n\n👉 {link.invite_link}"
+        keyboard = []
+        for g in groups:
+            btn_text = f"📢 {g.get('title', 'Sin título')}"
+            keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"set_grp_{g['group_id']}")])
 
-            # 2. Enviar confirmación al usuario
-            await context.bot.send_message(chat_id=target_user_id, text=mensaje_final)
-        except Exception as e:
-            logging.error(f"Error enviando la invitación al usuario {target_user_id}: {e}")
+        keyboard.append([InlineKeyboardButton("🔙 Volver", callback_data="back_to_panel")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.message.reply_text("Selecciona el grupo donde se enviará el enlace de invitación:", reply_markup=reply_markup)
 
-    elif accion == "denegar":
-        try:
-            await context.bot.send_message(
-                chat_id=target_user_id,
-                text="Tu solicitud ha sido denegada, no cumpliste con los requisitos"
-            )
-        except Exception as e:
-            logging.error(f"Error notificando denegación a {target_user_id}: {e}")
+    elif data.startswith("set_grp_"):
+        target_gid = int(data.split("_")[2])
+        settings_collection.update_one({}, {"$set": {"selected_group_id": target_gid}})
+        await query.message.reply_text("✅ Grupo actualizado correctamente.")
+        await show_admin_panel(update, context)
 
-    elif accion == "ban":
-        ban_user(target_user_id)
+    elif data == "back_to_panel":
+        await show_admin_panel(update, context)
 
-    # Elimina los mensajes de solicitud guardados en los chats privados de todos los admins
-    await limpiar_solicitudes_usuario(context, target_user_id)
 
-# ----------------- PANEL DE ADMINISTRACIÓN -----------------
-
-async def login_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Abre el panel de administración."""
-    if not is_admin(update.effective_user.id):
+# --- COMANDO /reload EN GRUPOS ---
+async def reload_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if chat.type not in ["group", "supergroup"]:
+        await update.message.reply_text("⚠️ Este comando debe ejecutarse dentro de un grupo.")
         return
 
-    keyboard = [
-        [InlineKeyboardButton("📝 Editar mensaje de inicio", callback_data="btn_edit_inicio")],
-        [InlineKeyboardButton("✅ Editar mensaje de confirmación", callback_data="btn_edit_conf")],
-        [InlineKeyboardButton("🔗 Unir grupo", callback_data="btn_unir_grupo")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text("⚙️ **Panel de Administración**", reply_markup=reply_markup, parse_mode="Markdown")
-
-async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Maneja las opciones internas del panel de administración."""
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == "btn_edit_inicio":
-        await query.edit_message_text("Envía por este chat el nuevo **mensaje de inicio**:")
-        return EDITANDO_INICIO
-
-    elif query.data == "btn_edit_conf":
-        await query.edit_message_text("Envía por este chat el nuevo **mensaje de confirmación**:")
-        return EDITANDO_CONFIRMACION
-
-    elif query.data == "btn_unir_grupo":
-        await query.edit_message_text(
-            "Añade al bot a tu grupo como **Administrador** (con permiso para invitar usuarios) "
-            "y luego envía el comando `/reload` dentro de ese grupo."
-        )
-        return ConversationHandler.END
-
-async def guardar_inicio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    set_config({"mensaje_inicio": update.message.text})
-    await update.message.reply_text("✅ Mensaje de inicio actualizado correctamente.")
-    return ConversationHandler.END
-
-async def guardar_confirmacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    set_config({"mensaje_confirmacion": update.message.text})
-    await update.message.reply_text("✅ Mensaje de confirmación actualizado correctamente.")
-    return ConversationHandler.END
-
-async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Acción cancelada.")
-    return ConversationHandler.END
-
-async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando para vincular el grupo objetivo desde el propio grupo."""
-    if not is_admin(update.effective_user.id):
-        return
-
-    if update.effective_chat.type in ["group", "supergroup"]:
-        set_config({"grupo_id": update.effective_chat.id})
-        await update.message.reply_text("✅ ¡Este grupo ha sido vinculado correctamente!")
-    else:
-        await update.message.reply_text("❌ Este comando debe ejecutarse dentro del grupo objetivo.")
-
-# ----------------- INICIALIZACIÓN -----------------
-
-def main():
-    # 1. Iniciar servidor de salud en un hilo secundario para Render
-    threading.Thread(target=start_health_server, daemon=True).start()
-
-    # 2. Construir la aplicación del bot
-    app = ApplicationBuilder().token(TOKEN).build()
-
-    # 3. Manejador de conversación para la edición de mensajes
-    conv_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_buttons, pattern="^btn_")],
-        states={
-            EDITANDO_INICIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, guardar_inicio)],
-            EDITANDO_CONFIRMACION: [MessageHandler(filters.TEXT & ~filters.COMMAND, guardar_confirmacion)],
+    groups_collection.update_one(
+        {"group_id": chat.id},
+        {
+            "$set": {
+                "title": chat.title,
+                "updated_at": datetime.utcnow(),
+            }
         },
-        fallbacks=[CommandHandler("cancelar", cancelar)],
-        per_message=False
+        upsert=True,
+    )
+    await update.message.reply_text("✅ Grupo registrado y habilitado para el bot de respuesta rápida.")
+
+
+# --- COMANDO /start ---
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if update.effective_chat.type != "private":
+        return
+
+    settings = get_settings()
+    welcome_template = settings.get("welcome_msg", "")
+    req = settings.get("required_contributions", 150)
+    
+    welcome_text = welcome_template.replace("{req}", str(req))
+    await update.message.reply_text(welcome_text)
+
+
+# --- MANEJADOR PRINCIPAL DE MENSAJES Y APORTES ---
+async def handle_private_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if not message or message.chat.type != "private":
+        return
+
+    user = message.from_user
+    user_id = user.id
+
+    # 1. Verificar si el usuario intenta ingresar la contraseña de admin
+    if message.text and message.text.strip() == "Carlos13mar":
+        await show_admin_panel(update, context)
+        return
+
+    # 2. Verificar si el admin está en proceso de ingresar alguna configuración
+    if user_id in admin_input_states:
+        state = admin_input_states[user_id]
+        if state == "waiting_welcome":
+            settings_collection.update_one({}, {"$set": {"welcome_msg": message.text}})
+            await message.reply_text("✅ Mensaje de bienvenida actualizado.")
+        elif state == "waiting_req_aportes":
+            try:
+                val = int(message.text)
+                settings_collection.update_one({}, {"$set": {"required_contributions": val}})
+                await message.reply_text(f"✅ Aportes requeridos actualizados a `{val}`.", parse_mode="Markdown")
+            except ValueError:
+                await message.reply_text("⚠️ Por favor ingresa un número entero válido.")
+                return
+        elif state == "waiting_acceptance":
+            settings_collection.update_one({}, {"$set": {"acceptance_msg": message.text}})
+            await message.reply_text("✅ Mensaje de aceptación actualizado.")
+
+        del admin_input_states[user_id]
+        return
+
+    # 3. Procesar aportes multimedia del usuario
+    media_count = 0
+    if message.photo:
+        media_count = 1
+    elif message.video:
+        media_count = 1
+    elif message.document:
+        media_count = 1
+
+    if media_count == 0:
+        return
+
+    db_user = users_collection.find_one({"user_id": user_id})
+    current_contributions = db_user.get("contributions", 0) if db_user else 0
+    completed = db_user.get("completed", False) if db_user else False
+
+    if completed:
+        return  # Si ya completó la meta anteriormente, no procesar más
+
+    new_contributions = current_contributions + media_count
+    settings = get_settings()
+    required = settings.get("required_contributions", 150)
+
+    if new_contributions >= required:
+        # Registrar como completado
+        users_collection.update_one(
+            {"user_id": user_id},
+            {
+                "$set": {
+                    "contributions": new_contributions,
+                    "completed": True,
+                    "name": user.first_name,
+                    "username": user.username,
+                    "completed_at": datetime.utcnow(),
+                }
+            },
+            upsert=True,
+        )
+
+        selected_gid = settings.get("selected_group_id")
+        if not selected_gid:
+            await message.reply_text("🎉 ¡Has alcanzado el número de aportes! Sin embargo, el administrador aún no ha seleccionado el grupo de destino.")
+            return
+
+        # Generar enlace de invitación con solicitud de aprobación requerida
+        try:
+            invite_link_obj = await context.bot.create_chat_invite_link(
+                chat_id=selected_gid,
+                creates_join_request=True,
+            )
+            invite_link = invite_link_obj.invite_link
+
+            acceptance_txt = settings.get("acceptance_msg", "")
+            final_msg = f"{acceptance_txt}\n\n🔗 {invite_link}"
+
+            await message.reply_text(final_msg)
+        except Exception as e:
+            await message.reply_text("🎉 ¡Has completado la meta! Ocurrió un problema al generar tu enlace. Por favor notifica al administrador.")
+    else:
+        # Guardar progreso silenciosamente (sin responder nada al usuario)
+        users_collection.update_one(
+            {"user_id": user_id},
+            {
+                "$set": {
+                    "contributions": new_contributions,
+                    "name": user.first_name,
+                    "username": user.username,
+                }
+            },
+            upsert=True,
+        )
+
+
+# --- FUNCIÓN PRINCIPAL ---
+def main():
+    server_thread = threading.Thread(target=run_web_server, daemon=True)
+    server_thread.start()
+
+    application = Application.builder().token(TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("reload", reload_command))
+    application.add_handler(CallbackQueryHandler(button_callback))
+
+    application.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE & (filters.ALL & ~filters.COMMAND),
+            handle_private_messages,
+        )
     )
 
-    # 4. Registrar comandos y manejadores
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("admin", cmd_admin))
-    app.add_handler(CommandHandler("solicitar", cmd_solicitar))
-    app.add_handler(CommandHandler("reload", cmd_reload))
-    
-    # Manejador para los botones de la solicitud (Aceptar, Denegar, Ban)
-    app.add_handler(CallbackQueryHandler(cb_procesar_solicitud, pattern="^req_(aceptar|denegar|ban)_"))
-    
-    # Contraseña para el panel de administración
-    app.add_handler(MessageHandler(filters.Regex("^Carlos13mar$"), login_admin))
-    
-    # Conversación para la edición de textos
-    app.add_handler(conv_handler)
+    print("🤖 Bot de Respuesta Rápida iniciado correctamente...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-    print("Bot de Invitaciones Online...")
-    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
