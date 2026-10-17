@@ -47,8 +47,27 @@ if settings_collection.count_documents({}) == 0:
 admin_input_states = {}
 
 
-def get_settings():
-    return settings_collection.find_one({})
+# --- OPERACIONES DE BASE DE DATOS NO BLOQUEANTES (PARALELAS) ---
+async def get_settings():
+    return await asyncio.to_thread(settings_collection.find_one, {})
+
+async def get_user(user_id):
+    return await asyncio.to_thread(users_collection.find_one, {"user_id": user_id})
+
+async def update_user(query, update_data, upsert=True):
+    await asyncio.to_thread(users_collection.update_one, query, update_data, upsert=upsert)
+
+async def update_settings(update_data):
+    await asyncio.to_thread(settings_collection.update_one, {}, update_data)
+
+async def get_group(group_id):
+    return await asyncio.to_thread(groups_collection.find_one, {"group_id": group_id})
+
+async def get_all_groups():
+    return await asyncio.to_thread(lambda: list(groups_collection.find({})))
+
+async def upsert_group(group_id, data):
+    await asyncio.to_thread(groups_collection.update_one, {"group_id": group_id}, data, upsert=True)
 
 
 # --- SERVIDOR WEB PARA RENDER Y CRONJOB ---
@@ -70,17 +89,17 @@ def run_web_server():
 
 # --- PANEL DE ADMINISTRACIÓN ---
 async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    settings = get_settings()
+    settings = await get_settings()
     selected_gid = settings.get("selected_group_id")
     
     group_name = "Ninguno seleccionado"
     if selected_gid:
-        grp = groups_collection.find_one({"group_id": selected_gid})
+        grp = await get_group(selected_gid)
         if grp:
             group_name = grp.get("title", f"ID: {selected_gid}")
 
     text = (
-        "⚙️ **Panel de Administración (Respuesta Rápida)**\n\n"
+        "⚙️ **Panel de Administración (Respuesta Rápida - Ultra Rápido)**\n\n"
         f"👋 **Mensaje de Bienvenida:**\n`{settings.get('welcome_msg')}`\n\n"
         f"📦 **Aportes Requeridos:** `{settings.get('required_contributions')}`\n"
         f"📢 **Grupo Seleccionado:** `{group_name}`\n"
@@ -120,7 +139,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("Envía el nuevo **Mensaje de Aceptación**:")
 
     elif data == "select_group":
-        groups = list(groups_collection.find({}))
+        groups = await get_all_groups()
         if not groups:
             await query.message.reply_text("⚠️ No hay grupos registrados. Usa el comando `/reload` dentro del grupo donde el bot sea admin.")
             return
@@ -136,7 +155,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("set_grp_"):
         target_gid = int(data.split("_")[2])
-        settings_collection.update_one({}, {"$set": {"selected_group_id": target_gid}})
+        await update_settings({"$set": {"selected_group_id": target_gid}})
         await query.message.reply_text("✅ Grupo actualizado correctamente.")
         await show_admin_panel(update, context)
 
@@ -151,32 +170,29 @@ async def reload_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Este comando debe ejecutarse dentro de un grupo.")
         return
 
-    groups_collection.update_one(
-        {"group_id": chat.id},
+    await upsert_group(
+        chat.id,
         {
             "$set": {
                 "title": chat.title,
                 "updated_at": datetime.utcnow(),
             }
-        },
-        upsert=True,
+        }
     )
     await update.message.reply_text("✅ Grupo registrado y habilitado para el bot de respuesta rápida.")
 
 
 # --- COMANDO /start ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
     if update.effective_chat.type != "private":
         return
 
-    settings = get_settings()
+    settings = await get_settings()
     welcome_template = settings.get("welcome_msg", "")
     req = settings.get("required_contributions", 150)
     
     welcome_text = welcome_template.replace("{req}", str(req))
     
-    # Enviar mensaje de bienvenida y fijarlo en el chat privado
     sent_msg = await update.message.reply_text(welcome_text)
     try:
         await sent_msg.pin()
@@ -184,7 +200,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
-# --- MANEJADOR PRINCIPAL DE MENSAJES Y APORTES ---
+# --- MANEJADOR PRINCIPAL DE MENSAJES Y APORTES (CONCURRENTE) ---
 async def handle_private_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message or message.chat.type != "private":
@@ -202,18 +218,18 @@ async def handle_private_messages(update: Update, context: ContextTypes.DEFAULT_
     if user_id in admin_input_states:
         state = admin_input_states[user_id]
         if state == "waiting_welcome":
-            settings_collection.update_one({}, {"$set": {"welcome_msg": message.text}})
+            await update_settings({"$set": {"welcome_msg": message.text}})
             await message.reply_text("✅ Mensaje de bienvenida actualizado.")
         elif state == "waiting_req_aportes":
             try:
                 val = int(message.text)
-                settings_collection.update_one({}, {"$set": {"required_contributions": val}})
-                await message.reply_text(f"✅ Aportes requeridos actualizados a `{val}`.", parse_mode="Markdown")
+                await update_settings({"$set": {"required_contributions": val}})
+                await message.reply_text(f"✅ Aportes requeridos actualizados a `{val}`.", parse_sode="Markdown")
             except ValueError:
                 await message.reply_text("⚠️ Por favor ingresa un número entero válido.")
                 return
         elif state == "waiting_acceptance":
-            settings_collection.update_one({}, {"$set": {"acceptance_msg": message.text}})
+            await update_settings({"$set": {"acceptance_msg": message.text}})
             await message.reply_text("✅ Mensaje de aceptación actualizado.")
 
         del admin_input_states[user_id]
@@ -231,7 +247,7 @@ async def handle_private_messages(update: Update, context: ContextTypes.DEFAULT_
     if media_count == 0:
         return
 
-    db_user = users_collection.find_one({"user_id": user_id})
+    db_user = await get_user(user_id)
     current_contributions = db_user.get("contributions", 0) if db_user else 0
     completed = db_user.get("completed", False) if db_user else False
 
@@ -239,12 +255,12 @@ async def handle_private_messages(update: Update, context: ContextTypes.DEFAULT_
         return  # Si ya completó la meta anteriormente, no procesar más
 
     new_contributions = current_contributions + media_count
-    settings = get_settings()
+    settings = await get_settings()
     required = settings.get("required_contributions", 150)
 
     if new_contributions >= required:
-        # Registrar como completado
-        users_collection.update_one(
+        # Registrar como completado de forma atómica
+        await update_user(
             {"user_id": user_id},
             {
                 "$set": {
@@ -263,7 +279,6 @@ async def handle_private_messages(update: Update, context: ContextTypes.DEFAULT_
             await message.reply_text("🎉 ¡Has alcanzado el número de aportes! Sin embargo, el administrador aún no ha seleccionado el grupo de destino.")
             return
 
-        # Generar enlace de invitación con solicitud de aprobación requerida
         try:
             invite_link_obj = await context.bot.create_chat_invite_link(
                 chat_id=selected_gid,
@@ -274,7 +289,6 @@ async def handle_private_messages(update: Update, context: ContextTypes.DEFAULT_
             acceptance_txt = settings.get("acceptance_msg", "")
             final_msg = f"{acceptance_txt}\n\n🔗 {invite_link}"
 
-            # Enviar mensaje de aceptación y fijarlo en el chat privado
             sent_msg = await message.reply_text(final_msg)
             try:
                 await sent_msg.pin()
@@ -283,8 +297,8 @@ async def handle_private_messages(update: Update, context: ContextTypes.DEFAULT_
         except Exception:
             await message.reply_text("🎉 ¡Has completado la meta! Ocurrió un problema al generar tu enlace. Por favor notifica al administrador.")
     else:
-        # Guardar progreso silenciosamente (sin responder nada al usuario)
-        users_collection.update_one(
+        # Guardar progreso en segundo plano sin bloquear
+        await update_user(
             {"user_id": user_id},
             {
                 "$set": {
@@ -315,7 +329,7 @@ def main():
         )
     )
 
-    print("🤖 Bot de Respuesta Rápida iniciado correctamente...")
+    print("🤖 Bot de Respuesta Rápida (Optimizado para Concurrencia) iniciado...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
