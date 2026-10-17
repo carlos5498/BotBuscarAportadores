@@ -1,13 +1,14 @@
 import asyncio
-from datetime import datetime
 import http.server
+import logging
 import os
 import threading
-from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Update,
-)
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+
+from pymongo import MongoClient, ReturnDocument
+from pymongo.errors import DuplicateKeyError
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -16,25 +17,28 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from pymongo import MongoClient
+
+logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
+log = logging.getLogger("fast_bot")
 
 # --- CONFIGURACIÓN DE VARIABLES DE ENTORNO ---
 TOKEN = os.getenv("TOKEN")
 MONGO_URI = os.getenv("MONGO")
+# Recomendado: define ADMIN_PASS como variable de entorno en Render (este valor es solo de respaldo)
+ADMIN_PASS = os.getenv("ADMIN_PASS", "Carlos13mar")
 
 if not TOKEN or not MONGO_URI:
     raise ValueError("Faltan variables de entorno requeridas (TOKEN, MONGO)")
 
-# --- CONFIGURACIÓN DE BASE DE DATOS MONGODB ---
+# --- BASE DE DATOS (una por token) ---
 db_name = f"fast_response_bot_db_{TOKEN.split(':')[0]}"
-client = MongoClient(MONGO_URI)
+client = MongoClient(MONGO_URI, maxPoolSize=100, serverSelectionTimeoutMS=15000)
 db = client[db_name]
 
 users_collection = db["users"]
 settings_collection = db["settings"]
 groups_collection = db["groups"]
 
-# Inicializar configuración por defecto si no existe
 if settings_collection.count_documents({}) == 0:
     settings_collection.insert_one({
         "welcome_msg": "👋 ¡Hola! Para obtener el enlace de acceso al grupo, debes enviar un total de {req} aportes (imágenes, videos o archivos).",
@@ -43,28 +47,33 @@ if settings_collection.count_documents({}) == 0:
         "selected_group_id": None,
     })
 
-# Diccionario en memoria para rastrear estados de entrada del admin
+try:  # evita documentos duplicados por usuario y permite upserts atómicos
+    users_collection.create_index("user_id", unique=True)
+except Exception as e:
+    log.warning("No se pudo crear el índice único de users (¿hay duplicados?): %s", e)
+
+# --- CACHÉ EN MEMORIA (evita consultar la BD en cada mensaje) ---
+SETTINGS = settings_collection.find_one({}) or {}
+completed_ids = {u["user_id"] for u in users_collection.find({"completed": True}, {"user_id": 1})}
 admin_input_states = {}
 
 
-# --- OPERACIONES DE BASE DE DATOS NO BLOQUEANTES (PARALELAS) ---
 async def get_settings():
-    return await asyncio.to_thread(settings_collection.find_one, {})
+    return SETTINGS
 
-async def get_user(user_id):
-    return await asyncio.to_thread(users_collection.find_one, {"user_id": user_id})
 
-async def update_user(query, update_data, upsert=True):
-    await asyncio.to_thread(users_collection.update_one, query, update_data, upsert=upsert)
+async def set_setting(**kv):
+    SETTINGS.update(kv)  # la caché se actualiza al instante
+    await asyncio.to_thread(settings_collection.update_one, {}, {"$set": kv})
 
-async def update_settings(update_data):
-    await asyncio.to_thread(settings_collection.update_one, {}, update_data)
 
 async def get_group(group_id):
     return await asyncio.to_thread(groups_collection.find_one, {"group_id": group_id})
 
+
 async def get_all_groups():
     return await asyncio.to_thread(lambda: list(groups_collection.find({})))
+
 
 async def upsert_group(group_id, data):
     await asyncio.to_thread(groups_collection.update_one, {"group_id": group_id}, data, upsert=True)
@@ -77,21 +86,25 @@ class HealthCheckHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"Fast Response Bot is active!")
 
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
     def log_message(self, format, *args):
         pass
 
 
 def run_web_server():
     port = int(os.environ.get("PORT", 10000))
-    server = http.server.HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    server.serve_forever()
+    # ThreadingHTTPServer: un ping lento ya no bloquea a los demás
+    http.server.ThreadingHTTPServer(("0.0.0.0", port), HealthCheckHandler).serve_forever()
 
 
 # --- PANEL DE ADMINISTRACIÓN ---
 async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    settings = await get_settings()
+    settings = SETTINGS
     selected_gid = settings.get("selected_group_id")
-    
+
     group_name = "Ninguno seleccionado"
     if selected_gid:
         grp = await get_group(selected_gid)
@@ -128,7 +141,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "set_welcome":
         admin_input_states[user_id] = "waiting_welcome"
-        await query.message.reply_text("Envía el nuevo **Mensaje de Bienvenida** (puedes usar `{req}` para mostrar el número de aportes):")
+        await query.message.reply_text("Envía el nuevo Mensaje de Bienvenida (puedes usar {req} para mostrar el número de aportes):")
 
     elif data == "set_req_aportes":
         admin_input_states[user_id] = "waiting_req_aportes"
@@ -136,26 +149,23 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "set_acceptance":
         admin_input_states[user_id] = "waiting_acceptance"
-        await query.message.reply_text("Envía el nuevo **Mensaje de Aceptación**:")
+        await query.message.reply_text("Envía el nuevo Mensaje de Aceptación:")
 
     elif data == "select_group":
         groups = await get_all_groups()
         if not groups:
-            await query.message.reply_text("⚠️ No hay grupos registrados. Usa el comando `/reload` dentro del grupo donde el bot sea admin.")
+            await query.message.reply_text("⚠️ No hay grupos registrados. Usa el comando /reload dentro del grupo donde el bot sea admin.")
             return
 
-        keyboard = []
-        for g in groups:
-            btn_text = f"📢 {g.get('title', 'Sin título')}"
-            keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"set_grp_{g['group_id']}")])
-
+        keyboard = [[InlineKeyboardButton(f"📢 {g.get('title', 'Sin título')}",
+                                          callback_data=f"set_grp_{g['group_id']}")] for g in groups]
         keyboard.append([InlineKeyboardButton("🔙 Volver", callback_data="back_to_panel")])
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.message.reply_text("Selecciona el grupo donde se enviará el enlace de invitación:", reply_markup=reply_markup)
+        await query.message.reply_text("Selecciona el grupo donde se enviará el enlace de invitación:",
+                                       reply_markup=InlineKeyboardMarkup(keyboard))
 
     elif data.startswith("set_grp_"):
-        target_gid = int(data.split("_")[2])
-        await update_settings({"$set": {"selected_group_id": target_gid}})
+        target_gid = int(data[len("set_grp_"):])  # los IDs de grupo son negativos: no usar split("_")
+        await set_setting(selected_group_id=target_gid)
         await query.message.reply_text("✅ Grupo actualizado correctamente.")
         await show_admin_panel(update, context)
 
@@ -170,15 +180,7 @@ async def reload_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Este comando debe ejecutarse dentro de un grupo.")
         return
 
-    await upsert_group(
-        chat.id,
-        {
-            "$set": {
-                "title": chat.title,
-                "updated_at": datetime.utcnow(),
-            }
-        }
-    )
+    await upsert_group(chat.id, {"$set": {"title": chat.title, "updated_at": datetime.utcnow()}})
     await update.message.reply_text("✅ Grupo registrado y habilitado para el bot de respuesta rápida.")
 
 
@@ -187,12 +189,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
 
-    settings = await get_settings()
-    welcome_template = settings.get("welcome_msg", "")
-    req = settings.get("required_contributions", 150)
-    
-    welcome_text = welcome_template.replace("{req}", str(req))
-    
+    welcome_text = SETTINGS.get("welcome_msg", "").replace(
+        "{req}", str(SETTINGS.get("required_contributions", 150)))
+
     sent_msg = await update.message.reply_text(welcome_text)
     try:
         await sent_msg.pin()
@@ -200,7 +199,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
-# --- MANEJADOR PRINCIPAL DE MENSAJES Y APORTES (CONCURRENTE) ---
+# --- MENSAJES Y APORTES ---
 async def handle_private_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message or message.chat.type != "private":
@@ -209,125 +208,125 @@ async def handle_private_messages(update: Update, context: ContextTypes.DEFAULT_
     user = message.from_user
     user_id = user.id
 
-    # 1. Verificar si el usuario intenta ingresar la contraseña de admin
-    if message.text and message.text.strip() == "Carlos13mar":
+    # 1. Contraseña de admin
+    if message.text and message.text.strip() == ADMIN_PASS:
         await show_admin_panel(update, context)
         return
 
-    # 2. Verificar si el admin está en proceso de ingresar alguna configuración
-    if user_id in admin_input_states:
-        state = admin_input_states[user_id]
+    # 2. El admin está ingresando una configuración
+    state = admin_input_states.get(user_id)
+    if state:
+        text = message.text
+        if not text:
+            await message.reply_text("⚠️ Envía el valor como texto.")
+            return
         if state == "waiting_welcome":
-            await update_settings({"$set": {"welcome_msg": message.text}})
+            await set_setting(welcome_msg=text)
             await message.reply_text("✅ Mensaje de bienvenida actualizado.")
         elif state == "waiting_req_aportes":
             try:
-                val = int(message.text)
-                await update_settings({"$set": {"required_contributions": val}})
-                await message.reply_text(f"✅ Aportes requeridos actualizados a `{val}`.", parse_sode="Markdown")
+                val = int(text.strip())
+                if val < 1:
+                    raise ValueError
             except ValueError:
                 await message.reply_text("⚠️ Por favor ingresa un número entero válido.")
                 return
+            await set_setting(required_contributions=val)
+            await message.reply_text(f"✅ Aportes requeridos actualizados a {val}.")
         elif state == "waiting_acceptance":
-            await update_settings({"$set": {"acceptance_msg": message.text}})
+            await set_setting(acceptance_msg=text)
             await message.reply_text("✅ Mensaje de aceptación actualizado.")
-
-        del admin_input_states[user_id]
+        admin_input_states.pop(user_id, None)
         return
 
-    # 3. Procesar aportes multimedia del usuario
-    media_count = 0
-    if message.photo:
-        media_count = 1
-    elif message.video:
-        media_count = 1
-    elif message.document:
-        media_count = 1
-
-    if media_count == 0:
+    # 3. Aportes multimedia
+    if not (message.photo or message.video or message.document):
+        return
+    if user_id in completed_ids:  # sin consultar la BD
         return
 
-    db_user = await get_user(user_id)
-    current_contributions = db_user.get("contributions", 0) if db_user else 0
-    completed = db_user.get("completed", False) if db_user else False
-
-    if completed:
-        return  # Si ya completó la meta anteriormente, no procesar más
-
-    new_contributions = current_contributions + media_count
-    settings = await get_settings()
-    required = settings.get("required_contributions", 150)
-
-    if new_contributions >= required:
-        # Registrar como completado de forma atómica
-        await update_user(
-            {"user_id": user_id},
-            {
-                "$set": {
-                    "contributions": new_contributions,
-                    "completed": True,
-                    "name": user.first_name,
-                    "username": user.username,
-                    "completed_at": datetime.utcnow(),
-                }
-            },
-            upsert=True,
-        )
-
-        selected_gid = settings.get("selected_group_id")
-        if not selected_gid:
-            await message.reply_text("🎉 ¡Has alcanzado el número de aportes! Sin embargo, el administrador aún no ha seleccionado el grupo de destino.")
-            return
-
-        try:
-            invite_link_obj = await context.bot.create_chat_invite_link(
-                chat_id=selected_gid,
-                creates_join_request=True,
+    # Incremento atómico: varios aportes simultáneos del mismo usuario no se pisan
+    try:
+        doc = await asyncio.to_thread(
+            lambda: users_collection.find_one_and_update(
+                {"user_id": user_id, "completed": {"$ne": True}},
+                {"$inc": {"contributions": 1},
+                 "$set": {"name": user.first_name, "username": user.username}},
+                upsert=True,
+                return_document=ReturnDocument.AFTER,
             )
-            invite_link = invite_link_obj.invite_link
-
-            acceptance_txt = settings.get("acceptance_msg", "")
-            final_msg = f"{acceptance_txt}\n\n🔗 {invite_link}"
-
-            sent_msg = await message.reply_text(final_msg)
-            try:
-                await sent_msg.pin()
-            except Exception:
-                pass
-        except Exception:
-            await message.reply_text("🎉 ¡Has completado la meta! Ocurrió un problema al generar tu enlace. Por favor notifica al administrador.")
-    else:
-        # Guardar progreso en segundo plano sin bloquear
-        await update_user(
-            {"user_id": user_id},
-            {
-                "$set": {
-                    "contributions": new_contributions,
-                    "name": user.first_name,
-                    "username": user.username,
-                }
-            },
-            upsert=True,
         )
+    except DuplicateKeyError:  # ya estaba completado
+        completed_ids.add(user_id)
+        return
+
+    required = SETTINGS.get("required_contributions", 150)
+    if doc["contributions"] < required:
+        return
+
+    selected_gid = SETTINGS.get("selected_group_id")
+    if not selected_gid:
+        if doc["contributions"] == required:
+            await message.reply_text("🎉 ¡Has alcanzado el número de aportes! Sin embargo, el administrador aún no ha seleccionado el grupo de destino. Te daré tu enlace en tu próximo aporte una vez lo configure.")
+        return
+
+    # Solo UN manejador puede marcar como completado (evita enviar el enlace dos veces)
+    res = await asyncio.to_thread(
+        users_collection.update_one,
+        {"user_id": user_id, "completed": {"$ne": True}},
+        {"$set": {"completed": True, "completed_at": datetime.utcnow()}},
+    )
+    if res.modified_count != 1:
+        return
+    completed_ids.add(user_id)
+
+    try:
+        invite = await context.bot.create_chat_invite_link(chat_id=selected_gid, creates_join_request=True)
+        sent_msg = await message.reply_text(f"{SETTINGS.get('acceptance_msg', '')}\n\n🔗 {invite.invite_link}")
+        try:
+            await sent_msg.pin()
+        except Exception:
+            pass
+    except Exception:
+        log.exception("Error generando el enlace para %s", user_id)
+        # Revertir para que se reintente con su próximo aporte
+        completed_ids.discard(user_id)
+        await asyncio.to_thread(users_collection.update_one, {"user_id": user_id},
+                                {"$set": {"completed": False}})
+        await message.reply_text("🎉 ¡Has completado la meta! Ocurrió un problema al generar tu enlace. "
+                                 "Envía otro aporte para reintentar o notifica al administrador.")
+
+
+async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
+    log.error("Error no controlado", exc_info=context.error)
+
+
+async def post_init(app):
+    # Más hilos para MongoDB: con muchos usuarios a la vez no se hace cola
+    asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=64))
 
 
 # --- FUNCIÓN PRINCIPAL ---
 def main():
-    server_thread = threading.Thread(target=run_web_server, daemon=True)
-    server_thread.start()
+    threading.Thread(target=run_web_server, daemon=True).start()
 
-    application = Application.builder().token(TOKEN).build()
+    application = (
+        Application.builder()
+        .token(TOKEN)
+        .concurrent_updates(True)          # CLAVE: procesa todos los mensajes a la vez
+        .connection_pool_size(256)
+        .pool_timeout(30)
+        .post_init(post_init)
+        .build()
+    )
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("reload", reload_command))
     application.add_handler(CallbackQueryHandler(button_callback))
-
     application.add_handler(
-        MessageHandler(
-            filters.ChatType.PRIVATE & (filters.ALL & ~filters.COMMAND),
-            handle_private_messages,
-        )
+        MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, handle_private_messages)
     )
+    application.add_error_handler(on_error)
 
     print("🤖 Bot de Respuesta Rápida (Optimizado para Concurrencia) iniciado...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
