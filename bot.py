@@ -175,7 +175,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     req = settings.get("required_contributions", 150)
     
     welcome_text = welcome_template.replace("{req}", str(req))
-    await update.message.reply_text(welcome_text)
+    
+    # Enviar mensaje de bienvenida y fijarlo en el chat privado
+    sent_msg = await update.message.reply_text(welcome_text)
+    try:
+        await sent_msg.pin()
+    except Exception:
+        pass
 
 
 # --- MANEJADOR PRINCIPAL DE MENSAJES Y APORTES ---
@@ -268,8 +274,13 @@ async def handle_private_messages(update: Update, context: ContextTypes.DEFAULT_
             acceptance_txt = settings.get("acceptance_msg", "")
             final_msg = f"{acceptance_txt}\n\n🔗 {invite_link}"
 
-            await message.reply_text(final_msg)
-        except Exception as e:
+            # Enviar mensaje de aceptación y fijarlo en el chat privado
+            sent_msg = await message.reply_text(final_msg)
+            try:
+                await sent_msg.pin()
+            except Exception:
+                pass
+        except Exception:
             await message.reply_text("🎉 ¡Has completado la meta! Ocurrió un problema al generar tu enlace. Por favor notifica al administrador.")
     else:
         # Guardar progreso silenciosamente (sin responder nada al usuario)
